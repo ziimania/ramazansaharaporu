@@ -559,10 +559,10 @@ with st.container():
             ["Sosyal Hizmetler Dairesi Başkanlığı"]
         )
     with c3:
-        location = st.text_input("Lokasyon / İşletme", placeholder="Örn: Mut Mezbahası")
+        location = st.text_input("Lokasyon / İşletme", placeholder="Örn: Eğitim ve Öğretimi Destekleme Kurs Merkezi")
 
     with st.expander("Ek Bilgi (Sicil Numarası)"):
-        sicil_no = st.text_input("Sicil No", value="1 3900 01 01 1170275 033 12 53")
+        sicil_no = st.text_input("Sicil No", value="1 8110 01 01 1170276 033 12 54-000")
 
 st.divider()
 
