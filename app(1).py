@@ -1,0 +1,701 @@
+import os
+import io
+import json
+import datetime
+import requests
+import streamlit as st
+from PIL import Image
+import docx
+from docx import Document
+from docx.shared import Inches, Pt
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.table import WD_TABLE_ALIGNMENT, WD_ALIGN_VERTICAL
+from docx.enum.section import WD_SECTION, WD_ORIENTATION
+from docx.oxml import parse_xml, OxmlElement
+from docx.oxml.ns import nsdecls, qn
+from streamlit_cookies_controller import CookieController
+
+# ----------------- SAYFA YAPILANDIRMASI -----------------
+st.set_page_config(
+    page_title="İSG Saha Gözetim Raporu",
+    page_icon="🛡️",
+    layout="centered"
+)
+
+st.markdown("""
+<style>
+    .block-container {
+        max-width: 860px !important;
+        padding-top: 1.5rem !important;
+        padding-bottom: 3rem !important;
+        margin: 0 auto !important;
+    }
+    .preview-box {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin-top: 10px;
+        margin-bottom: 10px;
+    }
+    .preview-box img {
+        width: 100px !important;
+        height: 100px !important;
+        object-fit: cover !important;
+        border-radius: 6px !important;
+        border: 1px solid #cbd5e1 !important;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# ----------------- ÇEREZ & SESSION YÖNETİMİ -----------------
+cookie_controller = CookieController()
+
+if "findings" not in st.session_state:
+    st.session_state.findings = []
+if "api_key" not in st.session_state:
+    st.session_state.api_key = ""
+if "form_reset_counter" not in st.session_state:
+    st.session_state.form_reset_counter = 0
+
+saved_cookie_key = cookie_controller.get("gemini_api_key")
+if saved_cookie_key and not st.session_state.api_key:
+    st.session_state.api_key = saved_cookie_key
+
+# ----------------- SOL MENÜ: API AYARLARI -----------------
+with st.sidebar:
+    st.header("⚙️ Sistem Ayarları")
+    st.caption("API Anahtarınız bulut sunucusuna gitmez; yalnızca tarayıcınızın çerezlerinde saklanır.")
+    
+    input_key = st.text_input(
+        "Gemini API Anahtarı",
+        type="password",
+        value=st.session_state.api_key,
+        help="Google AI Studio anahtarınızı buraya girip kaydedin."
+    )
+    
+    col_save, col_clear = st.columns(2)
+    with col_save:
+        if st.button("💾 Çereze Kaydet", use_container_width=True):
+            if input_key.strip():
+                st.session_state.api_key = input_key.strip()
+                cookie_controller.set("gemini_api_key", input_key.strip(), max_age=30*24*60*60)
+                st.success("Tarayıcıya kaydedildi!")
+            else:
+                st.warning("Lütfen bir anahtar girin.")
+                
+    with col_clear:
+        if st.button("🗑️ Çerezi Sil", use_container_width=True):
+            cookie_controller.remove("gemini_api_key")
+            st.session_state.api_key = ""
+            st.rerun()
+
+    active_api_key = input_key.strip() or st.session_state.api_key.strip()
+    if active_api_key:
+        st.success("✅ API Anahtarı Etkin")
+    else:
+        st.error("⚠️ Lütfen API anahtarınızı giriniz.")
+
+    st.markdown("---")
+    st.info(f"Eklenen Madde Sayısı: **{len(st.session_state.findings)}**")
+
+# ----------------- WORD YARDIMCI FONKSİYONLARI -----------------
+def tr_upper(text):
+    """Türkçe karakter uyumlu büyük harfe çevirme (i -> İ, ı -> I)."""
+    return text.replace("i", "İ").replace("ı", "I").upper()
+
+def set_cell_background(cell, hex_color):
+    tcPr = cell._element.get_or_add_tcPr()
+    shd = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{hex_color}"/>')
+    tcPr.append(shd)
+
+def set_cell_margins(cell, top=140, bottom=140, left=180, right=140):
+    tcPr = cell._element.get_or_add_tcPr()
+    tcMar = parse_xml(
+        f'<w:tcMar {nsdecls("w")}>'
+        f'<w:top w:w="{top}" w:type="dxa"/>'
+        f'<w:bottom w:w="{bottom}" w:type="dxa"/>'
+        f'<w:left w:w="{left}" w:type="dxa"/>'
+        f'<w:right w:w="{right}" w:type="dxa"/>'
+        f'</w:tcMar>'
+    )
+    tcPr.append(tcMar)
+
+def set_table_borders(table, color="000000"):
+    tblPr = table._element.xpath('w:tblPr')
+    if tblPr:
+        borders = parse_xml(
+            f'<w:tblBorders {nsdecls("w")}>'
+            f'<w:top w:val="single" w:sz="6" w:space="0" w:color="{color}"/>'
+            f'<w:bottom w:val="single" w:sz="6" w:space="0" w:color="{color}"/>'
+            f'<w:left w:val="single" w:sz="6" w:space="0" w:color="{color}"/>'
+            f'<w:right w:val="single" w:sz="6" w:space="0" w:color="{color}"/>'
+            f'<w:insideH w:val="single" w:sz="4" w:space="0" w:color="{color}"/>'
+            f'<w:insideV w:val="single" w:sz="4" w:space="0" w:color="{color}"/>'
+            f'</w:tblBorders>'
+        )
+        tblPr[0].append(borders)
+
+def create_word_field(instr_text, default_val="1", font_size_pt=12):
+    """Word otomatik alan kodu (PAGE / SECTIONPAGES) üretir."""
+    fld = OxmlElement('w:fldSimple')
+    fld.set(qn('w:instr'), instr_text)
+    
+    r_fld = OxmlElement('w:r')
+    r_pr = OxmlElement('w:rPr')
+    r_fonts = OxmlElement('w:rFonts')
+    r_fonts.set(qn('w:ascii'), 'Times New Roman')
+    r_fonts.set(qn('w:hAnsi'), 'Times New Roman')
+    r_sz = OxmlElement('w:sz')
+    r_sz.set(qn('w:val'), str(int(font_size_pt * 2)))
+    r_pr.append(r_fonts)
+    r_pr.append(r_sz)
+    r_fld.append(r_pr)
+    
+    r_t = OxmlElement('w:t')
+    r_t.text = str(default_val)
+    r_fld.append(r_t)
+    fld.append(r_fld)
+    return fld
+
+def add_page_number_to_footer(footer):
+    p = footer.paragraphs[0]
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p._p.append(create_word_field('PAGE', default_val="1", font_size_pt=10))
+    
+    run_sep = p.add_run(" / ")
+    run_sep.font.name = "Times New Roman"
+    run_sep.font.size = Pt(10)
+    
+    p._p.append(create_word_field('SECTIONPAGES', default_val="1", font_size_pt=10))
+
+def add_cover_line(doc, text, size=24, bold=False, space_after=12):
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p.paragraph_format.space_before = Pt(0)
+    p.paragraph_format.space_after = Pt(space_after)
+    r = p.add_run(text)
+    r.font.name = "Times New Roman"
+    r.font.size = Pt(size)
+    r.bold = bold
+    return p
+
+def remove_table_spacing(table):
+    for row in table.rows:
+        for cell in row.cells:
+            for p in cell.paragraphs:
+                p.paragraph_format.space_after = Pt(0)
+                p.paragraph_format.space_before = Pt(0)
+
+# ----------------- GEMINI API İLE METİN DÜZENLEME -----------------
+def call_gemini_ai(raw_note, api_key):
+    system_prompt = (
+        "Sen profesyonel bir İSG Saha Denetim Danışmanısın. "
+        "Gelen gözlem notlarını profesyonel bir rapora dönüştür. "
+        "Şu kurallara SIKI SIKIYA uy:\n"
+        "1. TESPİT: Sadece fiziksel gözlemi içermeli. Risk tanımlarını yazma. "
+        "TESPİT METNİNDEKİ SON CÜMLE MUTLAKA '... tespit edilmiştir.' İFADESİ İLE BİTMELİDİR.\n"
+        "2. ÖNERİ: Danışmanlık dili kullan. 'Derhal', 'Acilen' gibi emir kipleri yerine "
+        "'Yapılması önerilmektedir', 'Sağlanması uygun olacaktır' gibi ifadeler kullan.\n"
+        "3. YASAL DAYANAK: Konuyla ilgili TÜM yasal dayanakları (Kanun ve Yönetmelikler) bul. "
+        "Sadece isimlerini yaz. Birden fazla varsa bunları her biri ayrı satırda olacak şekilde alt alta listele.\n"
+        "Yanıtı SADECE şu JSON formatında ver: {\"tespit\": \"...\", \"oneri\": \"...\", \"yasal\": \"Yönetmelik 1\\nYönetmelik 2\"}"
+    )
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
+    payload = {
+        "contents": [{"parts": [{"text": f"Gözlem: \"{raw_note}\""}]}],
+        "systemInstruction": {"parts": [{"text": system_prompt}]},
+        "generationConfig": {"responseMimeType": "application/json"}
+    }
+    
+    response = requests.post(url, json=payload, timeout=30)
+    if response.status_code != 200:
+        raise Exception(f"Google API Hatası: {response.text}")
+    
+    return json.loads(response.json()["candidates"][0]["content"]["parts"][0]["text"])
+
+# ----------------- WORD BELGESİ OLUŞTURMA -----------------
+def generate_word_report(report_date, dept, location, sicil_no, findings):
+    doc = Document()
+    
+    # Word açıldığında sayfa sayılarını otomatik güncellemesi için ayar
+    settings_elem = doc.settings.element
+    update_fields = OxmlElement('w:updateFields')
+    update_fields.set(qn('w:val'), 'true')
+    settings_elem.append(update_fields)
+
+    # ---------------- 1. BÖLÜM: KAPAK SAYFASI ----------------
+    section_1 = doc.sections[0]
+    section_1.orientation = WD_ORIENTATION.LANDSCAPE
+    section_1.page_width = Inches(11.69)
+    section_1.page_height = Inches(8.27)
+    section_1.top_margin = Inches(0.6)
+    section_1.bottom_margin = Inches(0.5)
+    section_1.left_margin = Inches(0.8)
+    section_1.right_margin = Inches(0.8)
+    
+    formatted_date = report_date.strftime("%d.%m.%Y")
+    logo_exists = os.path.exists("logo.png")
+    dept_upper = tr_upper(dept)
+
+    p_cov_logo = doc.add_paragraph()
+    p_cov_logo.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p_cov_logo.paragraph_format.space_before = Pt(24)
+    p_cov_logo.paragraph_format.space_after = Pt(18)
+    
+    if logo_exists:
+        cm_to_inches = 2.54
+        w_in = 8.52 / cm_to_inches
+        h_in = 6.95 / cm_to_inches
+        p_cov_logo.add_run().add_picture("logo.png", width=Inches(w_in), height=Inches(h_in))
+    else:
+        r_l = p_cov_logo.add_run("[LOGO - logo.png]")
+        r_l.bold = True
+
+    add_cover_line(doc, "T.C.", 24, bold=False, space_after=6)
+    add_cover_line(doc, "MERSİN BÜYÜKŞEHİR BELEDİYESİ", 24, bold=False, space_after=6)
+    add_cover_line(doc, f"{dept_upper}", 24, bold=False, space_after=12)
+    add_cover_line(doc, f"Sicil No: {sicil_no}", 24, bold=False, space_after=36)
+    add_cover_line(doc, "İSG Saha Gözetim Raporu", 24, bold=True, space_after=12)
+    add_cover_line(doc, formatted_date, 24, bold=False, space_after=0)
+
+    # ---------------- 2. BÖLÜM: RAPOR SAYFALARI ----------------
+    section_2 = doc.add_section(WD_SECTION.NEW_PAGE)
+    section_2.orientation = WD_ORIENTATION.LANDSCAPE
+    section_2.page_width = Inches(11.69)
+    section_2.page_height = Inches(8.27)
+    section_2.top_margin = Inches(0.6)
+    section_2.bottom_margin = Inches(0.5)
+    section_2.left_margin = Inches(0.8)
+    section_2.right_margin = Inches(0.8)
+    
+    section_2.header.is_linked_to_previous = False
+    section_2.footer.is_linked_to_previous = False
+
+    sectPr = section_2._sectPr
+    pgNumType = OxmlElement('w:pgNumType')
+    pgNumType.set(qn('w:start'), '1')
+    sectPr.append(pgNumType)
+
+    # GİRİŞ CÜMLESİ
+    p_intro = doc.add_paragraph()
+    p_intro.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+    p_intro.paragraph_format.space_before = Pt(6) 
+    p_intro.paragraph_format.space_after = Pt(12)
+
+    r_in1 = p_intro.add_run(f"{formatted_date} tarihinde {dept}’na Bağlı ")
+    r_in2 = p_intro.add_run(f"{location} ")
+    r_in2.bold = True
+    r_in3 = p_intro.add_run(
+        "İş Güvenliği Uzmanı tarafından yapılan saha denetiminde, tespit edilen hususlara ilişkin "
+        "“Tespit / Uygunsuzluk ve Öneriler” aşağıda belirtilmiştir."
+    )
+    for r in [r_in1, r_in2, r_in3]:
+        r.font.name = "Times New Roman"
+        r.font.size = Pt(12)
+
+    # ÜST BİLGİ (HEADER) - SADECE 2. BÖLÜMDE GÖSTERİLİR
+    header = section_2.header
+    header.paragraphs[0].paragraph_format.space_before = Pt(0)
+    header.paragraphs[0].paragraph_format.space_after = Pt(0)
+
+    header_table = header.add_table(rows=2, cols=3, width=Inches(10.1))
+    header_table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    header_table.autofit = False
+    set_table_borders(header_table, "000000")
+    
+    col_w = [Inches(1.8), Inches(6.1), Inches(2.2)]
+    for row in header_table.rows:
+        for i, w in enumerate(col_w):
+            row.cells[i].width = w
+
+    cell_h_logo = header_table.cell(0, 0)
+    cell_h_logo.merge(header_table.cell(1, 0))
+    cell_h_logo.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+    p_h_logo = cell_h_logo.paragraphs[0]
+    p_h_logo.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    if logo_exists:
+        p_h_logo.add_run().add_picture("logo.png", width=Inches(1.3))
+    else:
+        p_h_logo.add_run("[LOGO]").bold = True
+
+    cell_h_mid = header_table.cell(0, 1)
+    cell_h_mid.merge(header_table.cell(1, 1))
+    cell_h_mid.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+    p_h_mid = cell_h_mid.paragraphs[0]
+    p_h_mid.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    
+    rh1 = p_h_mid.add_run("İŞ SAĞLIĞI VE GÜVENLİĞİ SAHA GÖZETİM RAPORU\n")
+    rh2 = p_h_mid.add_run("MERSİN BÜYÜKŞEHİR BELEDİYESİ\n")
+    rh3 = p_h_mid.add_run(f"{dept_upper}\n")
+    rh4 = p_h_mid.add_run(f"Sicil No : {sicil_no}")
+    for r in [rh1, rh2, rh3, rh4]:
+        r.bold = True
+        r.font.name = "Times New Roman"
+        r.font.size = Pt(12)
+
+    cell_h_date = header_table.cell(0, 2)
+    cell_h_date.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+    set_cell_margins(cell_h_date, top=0, bottom=0, left=120, right=80)
+    p_hd = cell_h_date.paragraphs[0]
+    r_h_dlbl = p_hd.add_run("Tarih: ")
+    r_h_dlbl.bold = True
+    r_h_dtxt = p_hd.add_run(formatted_date)
+    for r in [r_h_dlbl, r_h_dtxt]:
+        r.font.name = "Times New Roman"
+        r.font.size = Pt(11)
+
+    cell_h_sec = header_table.cell(1, 2)
+    cell_h_sec.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+    set_cell_margins(cell_h_sec, top=0, bottom=0, left=120, right=80)
+    p_hs = cell_h_sec.paragraphs[0]
+    r_h_slbl = p_hs.add_run("Bölüm: ")
+    r_h_slbl.bold = True
+    r_h_stxt = p_hs.add_run(location)
+    for r in [r_h_slbl, r_h_stxt]:
+        r.font.name = "Times New Roman"
+        r.font.size = Pt(11)
+
+    # Önce tüm tabloyu 0 nk yap, ardından sağ sütundaki Tarih ve Bölüm hücrelerine 10 nk Önce/Sonra aralık ver
+    remove_table_spacing(header_table)
+    p_hd.paragraph_format.space_before = Pt(10)
+    p_hd.paragraph_format.space_after = Pt(10)
+    p_hs.paragraph_format.space_before = Pt(10)
+    p_hs.paragraph_format.space_after = Pt(10)
+    
+    p_header_spacer = header.add_paragraph()
+    p_header_spacer.paragraph_format.space_before = Pt(3)
+    p_header_spacer.paragraph_format.space_after = Pt(0)
+
+    add_page_number_to_footer(section_2.footer)
+
+    # BULGULAR TABLOSU
+    findings_table = doc.add_table(rows=1, cols=2)
+    findings_table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    findings_table.autofit = False
+    set_table_borders(findings_table, "000000")
+    
+    tbl_widths = [Inches(4.1), Inches(6.0)]
+    
+    hdr_cells = findings_table.rows[0].cells
+    hdr_cells[0].width = tbl_widths[0]
+    hdr_cells[1].width = tbl_widths[1]
+    
+    set_cell_background(hdr_cells[0], "F2F2F2")
+    set_cell_background(hdr_cells[1], "F2F2F2")
+    
+    p_th0 = hdr_cells[0].paragraphs[0]
+    p_th0.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    r_th0 = p_th0.add_run("Fotoğraf")
+    r_th0.bold = True
+    r_th0.font.name = "Times New Roman"
+    r_th0.font.size = Pt(12)
+    
+    p_th1 = hdr_cells[1].paragraphs[0]
+    p_th1.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    r_th1 = p_th1.add_run("Açıklamalar")
+    r_th1.bold = True
+    r_th1.font.name = "Times New Roman"
+    r_th1.font.size = Pt(12)
+
+    for f in findings:
+        row_cells = findings_table.add_row().cells
+        row_cells[0].width = tbl_widths[0]
+        row_cells[1].width = tbl_widths[1]
+        
+        set_cell_margins(row_cells[0], top=120, bottom=120, left=100, right=100)
+        set_cell_margins(row_cells[1], top=120, bottom=120, left=160, right=140)
+
+        cell_img = row_cells[0]
+        cell_img.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+        p_img = cell_img.paragraphs[0]
+        p_img.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        
+        if f["photos"]:
+            num_p = len(f["photos"])
+            calc_w = Inches(3.2) if num_p == 1 else Inches(1.8)
+                
+            for p_idx, p_bytes in enumerate(f["photos"]):
+                img_stream = io.BytesIO(p_bytes)
+                p_img.add_run().add_picture(img_stream, width=calc_w)
+                
+                if (p_idx + 1) % 2 == 0 and p_idx < num_p - 1:
+                    p_img.add_run().add_break(docx.enum.text.WD_BREAK.LINE)
+                elif p_idx < num_p - 1:
+                    p_img.add_run("  ") 
+        else:
+            r_no = p_img.add_run("Görsel Eklenmedi")
+            r_no.font.name = "Times New Roman"
+            r_no.font.size = Pt(11)
+
+        cell_desc = row_cells[1]
+        cell_desc.vertical_alignment = WD_ALIGN_VERTICAL.TOP
+        
+        # 1. TESPİT
+        p_f = cell_desc.paragraphs[0]
+        p_f.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+        r_f_lbl = p_f.add_run("Tespit / Uygunsuzluk:")
+        r_f_lbl.bold = True
+        r_f_lbl.underline = True
+        r_f_lbl.font.name = "Times New Roman"
+        r_f_lbl.font.size = Pt(12)
+        
+        r_f_sp = p_f.add_run(" ")
+        r_f_sp.font.name = "Times New Roman"
+        r_f_sp.font.size = Pt(12)
+        
+        r_f_txt = p_f.add_run(f["finding"])
+        r_f_txt.font.name = "Times New Roman"
+        r_f_txt.font.size = Pt(12)
+            
+        # 2. ÖNERİ
+        p_s = cell_desc.add_paragraph()
+        p_s.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+        r_s_lbl = p_s.add_run("Öneri:")
+        r_s_lbl.bold = True
+        r_s_lbl.underline = True
+        r_s_lbl.font.name = "Times New Roman"
+        r_s_lbl.font.size = Pt(12)
+        
+        r_s_sp = p_s.add_run(" ")
+        r_s_sp.font.name = "Times New Roman"
+        r_s_sp.font.size = Pt(12)
+        
+        r_s_txt = p_s.add_run(f["suggestion"])
+        r_s_txt.font.name = "Times New Roman"
+        r_s_txt.font.size = Pt(12)
+            
+        # 3. YASAL DAYANAK
+        p_l_head = cell_desc.add_paragraph()
+        r_l_lbl = p_l_head.add_run("Yasal Dayanak:")
+        r_l_lbl.bold = True
+        r_l_lbl.underline = True
+        r_l_lbl.font.name = "Times New Roman"
+        r_l_lbl.font.size = Pt(12)
+        
+        legal_lines = [l.strip() for l in f["legal"].split("\n") if l.strip()]
+        for line in legal_lines:
+            line_clean = line.replace("•", "").replace("-", "").strip()
+            p_bullet = cell_desc.add_paragraph() 
+            p_bullet.paragraph_format.left_indent = Inches(0.25)
+            p_bullet.paragraph_format.space_before = Pt(0)
+            p_bullet.paragraph_format.space_after = Pt(2)
+            r_bullet = p_bullet.add_run(f"•  {line_clean}")
+            r_bullet.font.name = "Times New Roman"
+            r_bullet.font.size = Pt(12)
+            
+        # 4. SORUMLULAR
+        p_r = cell_desc.add_paragraph()
+        r_r_lbl = p_r.add_run("Sorumlular:")
+        r_r_lbl.bold = True
+        r_r_lbl.underline = True
+        r_r_lbl.font.name = "Times New Roman"
+        r_r_lbl.font.size = Pt(12)
+        
+        r_r_sp = p_r.add_run(" ")
+        r_r_sp.font.name = "Times New Roman"
+        r_r_sp.font.size = Pt(12)
+        
+        r_r_txt = p_r.add_run(f["responsible"])
+        r_r_txt.font.name = "Times New Roman"
+        r_r_txt.font.size = Pt(12)
+            
+        # 5. TERMİN
+        p_t = cell_desc.add_paragraph()
+        r_t_lbl = p_t.add_run("Termin:")
+        r_t_lbl.bold = True
+        r_t_lbl.underline = True
+        r_t_lbl.font.name = "Times New Roman"
+        r_t_lbl.font.size = Pt(12)
+        
+        r_t_sp = p_t.add_run(" ")
+        r_t_sp.font.name = "Times New Roman"
+        r_t_sp.font.size = Pt(12)
+        
+        r_t_txt = p_t.add_run(f["termin"])
+        r_t_txt.font.name = "Times New Roman"
+        r_t_txt.font.size = Pt(12)
+
+    # ================= KAPANIS CÜMLESİ =================
+    p_spacer = doc.add_paragraph()
+    p_spacer.paragraph_format.space_after = Pt(6)
+
+    p_close = doc.add_paragraph()
+    p_close.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    count = len(findings)
+    
+    r_c1 = p_close.add_run(
+        f"İş bu rapor {count} madde tehlike ve buna bağlı oluşabilecek riskler ve "
+        f"alınması gereken önlemler olmak üzere toplam "
+    )
+    r_c1.font.name = "Times New Roman"
+    r_c1.font.size = Pt(12)
+    
+    p_close._p.append(create_word_field('SECTIONPAGES', default_val=str(count), font_size_pt=12))
+    
+    r_c2 = p_close.add_run(f" sayfadan ibarettir. ({formatted_date})")
+    r_c2.font.name = "Times New Roman"
+    r_c2.font.size = Pt(12)
+
+    file_stream = io.BytesIO()
+    doc.save(file_stream)
+    file_stream.seek(0)
+    return file_stream
+
+# ----------------- STREAMLIT ÖN YÜZ -----------------
+st.title("🛡️ İSG Saha Gözetim Raporu")
+
+f_id = st.session_state.form_reset_counter
+
+with st.container():
+    st.subheader("📋 Rapor Üst Bilgileri")
+    c1, c2, c3 = st.columns([1.2, 2.2, 1.8])
+    with c1:
+        report_date = st.date_input("Rapor Tarihi", datetime.date.today())
+    with c2:
+        dept = st.selectbox(
+            "Daire Başkanlığı",
+            ["Veteriner İşleri Dairesi Başkanlığı", "Tarımsal Hizmetler Dairesi Başkanlığı"]
+        )
+    with c3:
+        location = st.text_input("Lokasyon / İşletme", placeholder="Örn: Mut Mezbahası")
+
+    with st.expander("Ek Bilgi (Sicil Numarası)"):
+        sicil_no = st.text_input("Sicil No", value="1 3900 01 01 1170275 033 12 53")
+
+st.divider()
+
+st.subheader("🔍 Tespit / Uygunsuzluk Ekle")
+
+for k, default_v in [
+    (f"raw_note_{f_id}", ""),
+    (f"tespit_{f_id}", ""),
+    (f"oneri_{f_id}", ""),
+    (f"yasal_{f_id}", ""),
+    (f"sorumlu_{f_id}", dept),
+    (f"termin_{f_id}", "İvedilikle")
+]:
+    if k not in st.session_state:
+        st.session_state[k] = default_v
+
+if "last_selected_dept" not in st.session_state:
+    st.session_state.last_selected_dept = dept
+if st.session_state.last_selected_dept != dept:
+    st.session_state[f"sorumlu_{f_id}"] = dept
+    st.session_state.last_selected_dept = dept
+
+col_note, col_btn = st.columns([3.5, 1.5])
+with col_note:
+    st.text_input("Saha Notunuz (Hızlı Giriş)", placeholder="Örn: Yangın tüpü yok...", key=f"raw_note_{f_id}")
+with col_btn:
+    st.write("")
+    st.write("")
+    ai_btn = st.button("✨ Yapay Zeka ile Düzenle", use_container_width=True)
+
+if ai_btn:
+    if not active_api_key:
+        st.error("Lütfen sol taraftan Gemini API anahtarınızı giriniz.")
+    elif not st.session_state[f"raw_note_{f_id}"].strip():
+        st.warning("Lütfen kısa bir saha gözlem notu girin.")
+    else:
+        with st.spinner("İSG standartlarına göre düzenleniyor..."):
+            try:
+                note = st.session_state[f"raw_note_{f_id}"]
+                res = call_gemini_ai(note, active_api_key)
+                
+                st.session_state[f"tespit_{f_id}"] = res.get("tespit", "")
+                st.session_state[f"oneri_{f_id}"] = res.get("oneri", "")
+                st.session_state[f"yasal_{f_id}"] = res.get("yasal", "")
+                
+                st.success("Yapay zeka düzenledi!")
+            except Exception as e:
+                st.error(f"Hata: {str(e)}")
+
+st.text_area("Tespit / Uygunsuzluk", height=85, key=f"tespit_{f_id}")
+st.text_area("Öneri / Önlem", height=85, key=f"oneri_{f_id}")
+
+col_l, col_r, col_t = st.columns([2, 1.2, 1])
+with col_l:
+    st.text_area("Yasal Dayanak (Satır Satır)", height=80, key=f"yasal_{f_id}")
+with col_r:
+    st.text_input("Sorumlular", key=f"sorumlu_{f_id}")
+with col_t:
+    st.text_input("Termin", key=f"termin_{f_id}")
+
+uploaded_photos = st.file_uploader(
+    "Fotoğraflar (Birden fazla seçebilirsiniz)",
+    type=["jpg", "jpeg", "png"],
+    accept_multiple_files=True,
+    key=f"photo_uploader_{f_id}"
+)
+
+if uploaded_photos:
+    st.caption("Yüklenen Fotoğraf Önizlemeleri:")
+    st.markdown('<div class="preview-box">', unsafe_allow_html=True)
+    cols = st.columns(min(len(uploaded_photos), 6))
+    for idx, photo in enumerate(uploaded_photos):
+        with cols[idx % 6]:
+            st.image(photo, width=100)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+if st.button("➕ Bu Maddeyi Listeye Kaydet", type="primary", use_container_width=True):
+    anlik_tespit = st.session_state[f"tespit_{f_id}"]
+    anlik_oneri = st.session_state[f"oneri_{f_id}"]
+    anlik_yasal = st.session_state[f"yasal_{f_id}"]
+    anlik_sorumlu = st.session_state[f"sorumlu_{f_id}"]
+    anlik_termin = st.session_state[f"termin_{f_id}"]
+
+    if not anlik_tespit.strip():
+        st.warning("Tespit alanı boş bırakılamaz.")
+    else:
+        photo_bytes_list = [p.getvalue() for p in uploaded_photos] if uploaded_photos else []
+        
+        st.session_state.findings.append({
+            "finding": anlik_tespit.strip(),
+            "suggestion": anlik_oneri.strip(),
+            "legal": anlik_yasal.strip(),
+            "responsible": anlik_sorumlu.strip(),
+            "termin": anlik_termin.strip(),
+            "photos": photo_bytes_list
+        })
+        
+        st.session_state.form_reset_counter += 1
+        st.success("Madde başarıyla listeye eklendi!")
+        st.rerun()
+
+st.divider()
+
+st.subheader("📑 Eklenen Maddeler")
+
+if not st.session_state.findings:
+    st.info("Henüz eklenen madde yok.")
+else:
+    for idx, item in enumerate(st.session_state.findings):
+        with st.expander(f"Madde {idx + 1}: {item['finding'][:70]}..."):
+            st.markdown(f"**Tespit:** {item['finding']}")
+            st.markdown(f"**Öneri:** {item['suggestion']}")
+            st.markdown(f"**Yasal Dayanak:**\n{item['legal']}")
+            st.caption(f"Fotoğraf Sayısı: {len(item['photos'])} | Sorumlu: {item['responsible']}")
+            if st.button(f"🗑️ Sil", key=f"del_btn_{idx}"):
+                st.session_state.findings.pop(idx)
+                st.rerun()
+
+    st.write("")
+    loc_name = location.strip().replace(" ", "_") if location else "Saha"
+    doc_bytes = generate_word_report(
+        report_date=report_date,
+        dept=dept,
+        location=location or "..................",
+        sicil_no=sicil_no,
+        findings=st.session_state.findings
+    )
+    
+    st.download_button(
+        label="📥 YATAY WORD RAPORUNU İNDİR (.DOCX)",
+        data=doc_bytes,
+        file_name=f"Saha_Raporu-{loc_name}_{report_date.strftime('%d.%m.%Y')}.docx",
+        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        type="primary",
+        use_container_width=True
+    )
