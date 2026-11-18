@@ -3,6 +3,7 @@ import io
 import json
 import datetime
 import requests
+import re  # Versiyon tespiti için eklendi
 import streamlit as st
 from PIL import Image
 import docx
@@ -187,8 +188,37 @@ def remove_table_spacing(table):
                 p.paragraph_format.space_after = Pt(0)
                 p.paragraph_format.space_before = Pt(0)
 
+# ----------------- GEMINI MODEL BULUCU -----------------
+@st.cache_data(ttl=86400) # Günde bir kez kontrol et (hızdan ödün vermemek için)
+def get_latest_flash_model(api_key):
+    try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+        response = requests.get(url, timeout=10)
+        
+        if response.status_code == 200:
+            models = response.json().get("models", [])
+            max_version = 0.0
+            best_model = "gemini-2.0-flash" # Varsayılan
+            
+            for m in models:
+                name = m.get("name", "") 
+                if "gemini" in name and "flash" in name and "exp" not in name and "vision" not in name:
+                    match = re.search(r'gemini-(\d+\.\d+)-flash', name)
+                    if match:
+                        version = float(match.group(1))
+                        if version > max_version:
+                            max_version = version
+                            best_model = name.replace("models/", "")
+            return best_model
+    except Exception:
+        pass
+        
+    return "gemini-2.0-flash" # Hata olursa varsayılan
+
 # ----------------- GEMINI API İLE METİN DÜZENLEME -----------------
 def call_gemini_ai(raw_note, api_key):
+    best_model = get_latest_flash_model(api_key)
+    
     system_prompt = (
         "Sen profesyonel bir İSG Saha Denetim Danışmanısın. "
         "Gelen gözlem notlarını profesyonel bir rapora dönüştür. "
@@ -202,7 +232,7 @@ def call_gemini_ai(raw_note, api_key):
         "Yanıtı SADECE şu JSON formatında ver: {\"tespit\": \"...\", \"oneri\": \"...\", \"yasal\": \"Yönetmelik 1\\nYönetmelik 2\"}"
     )
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{best_model}:generateContent?key={api_key}"
     payload = {
         "contents": [{"parts": [{"text": f"Gözlem: \"{raw_note}\""}]}],
         "systemInstruction": {"parts": [{"text": system_prompt}]},
