@@ -556,7 +556,7 @@ with st.container():
     with c2:
         dept = st.selectbox(
             "Daire Başkanlığı",
-            ["Veteriner İşleri Dairesi Başkanlığı", "Tarımsal Hizmetler Dairesi Başkanlığı"]
+            ["Sosyal Hizmetler Dairesi Başkanlığı"]
         )
     with c3:
         location = st.text_input("Lokasyon / İşletme", placeholder="Örn: Mut Mezbahası")
