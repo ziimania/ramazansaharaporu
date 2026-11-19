@@ -3,7 +3,7 @@ import io
 import json
 import datetime
 import requests
-import re  # Versiyon tespiti için eklendi
+import re
 import streamlit as st
 from PIL import Image
 import docx
@@ -49,6 +49,71 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# ----------------- GEMINI MODEL BULUCU -----------------
+@st.cache_data(ttl=86400)  # Günde bir kez kontrol et
+def get_available_flash_models(api_key):
+    """
+    Sadece generateContent destekleyen, kararlı (preview/thinking/tts/audio/image hariç)
+    Gemini Flash modellerini en yeni sürümden eskiye doğru sıralı döndürür.
+    """
+    fallback_defaults = ["gemini-flash-latest", "gemini-2.0-flash"]
+    excluded_keywords = (
+        "exp", "vision", "preview", "tts", "audio",
+        "image", "thinking", "live", "embed", "aqa", "learnlm"
+    )
+
+    try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+        response = requests.get(url, timeout=15)
+
+        if response.status_code == 200:
+            models = response.json().get("models", [])
+            primary_flash = []
+            lite_flash = []
+            has_flash_latest = False
+
+            for m in models:
+                name = m.get("name", "")
+                methods = m.get("supportedGenerationMethods", [])
+
+                if "generateContent" not in methods:
+                    continue
+
+                name_lower = name.lower()
+                if any(bad in name_lower for bad in excluded_keywords):
+                    continue
+
+                # 1. Öncelik: Tam kararlı Flash modelleri (örn: gemini-3.0-flash, gemini-2.5-flash, gemini-2.0-flash)
+                match_main = re.match(r"^models/gemini-(\d+(?:\.\d+)?)-flash$", name_lower)
+                if match_main:
+                    primary_flash.append((float(match_main.group(1)), name.replace("models/", "")))
+                    continue
+
+                # 2. Öncelik: Yedek olarak kararlı Flash-Lite modelleri
+                match_lite = re.match(r"^models/gemini-(\d+(?:\.\d+)?)-flash-lite$", name_lower)
+                if match_lite:
+                    lite_flash.append((float(match_lite.group(1)), name.replace("models/", "")))
+                    continue
+
+                # 3. Öncelik: Google'ın güncel takma adı (alias)
+                if name_lower == "models/gemini-flash-latest":
+                    has_flash_latest = True
+
+            primary_flash.sort(key=lambda x: x[0], reverse=True)
+            lite_flash.sort(key=lambda x: x[0], reverse=True)
+
+            ordered_models = [m_name for _, m_name in primary_flash]
+            ordered_models.extend(m_name for _, m_name in lite_flash)
+            if has_flash_latest and "gemini-flash-latest" not in ordered_models:
+                ordered_models.append("gemini-flash-latest")
+
+            if ordered_models:
+                return ordered_models
+    except Exception:
+        pass
+
+    return fallback_defaults
+
 # ----------------- ÇEREZ & SESSION YÖNETİMİ -----------------
 cookie_controller = CookieController()
 
@@ -81,6 +146,7 @@ with st.sidebar:
             if input_key.strip():
                 st.session_state.api_key = input_key.strip()
                 cookie_controller.set("gemini_api_key", input_key.strip(), max_age=30*24*60*60)
+                get_available_flash_models.clear()
                 st.success("Tarayıcıya kaydedildi!")
             else:
                 st.warning("Lütfen bir anahtar girin.")
@@ -89,11 +155,16 @@ with st.sidebar:
         if st.button("🗑️ Çerezi Sil", use_container_width=True):
             cookie_controller.remove("gemini_api_key")
             st.session_state.api_key = ""
+            get_available_flash_models.clear()
             st.rerun()
 
     active_api_key = input_key.strip() or st.session_state.api_key.strip()
     if active_api_key:
         st.success("✅ API Anahtarı Etkin")
+        detected_models = get_available_flash_models(active_api_key)
+        st.caption(f"🤖 Aktif Model: **{detected_models[0]}**")
+        if len(detected_models) > 1:
+            st.caption(f"🔄 Yedek Modeller: {', '.join(detected_models[1:3])}")
     else:
         st.error("⚠️ Lütfen API anahtarınızı giriniz.")
 
@@ -188,37 +259,10 @@ def remove_table_spacing(table):
                 p.paragraph_format.space_after = Pt(0)
                 p.paragraph_format.space_before = Pt(0)
 
-# ----------------- GEMINI MODEL BULUCU -----------------
-@st.cache_data(ttl=86400) # Günde bir kez kontrol et (hızdan ödün vermemek için)
-def get_latest_flash_model(api_key):
-    try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
-        response = requests.get(url, timeout=10)
-        
-        if response.status_code == 200:
-            models = response.json().get("models", [])
-            max_version = 0.0
-            best_model = "gemini-2.0-flash" # Varsayılan
-            
-            for m in models:
-                name = m.get("name", "") 
-                if "gemini" in name and "flash" in name and "exp" not in name and "vision" not in name:
-                    match = re.search(r'gemini-(\d+\.\d+)-flash', name)
-                    if match:
-                        version = float(match.group(1))
-                        if version > max_version:
-                            max_version = version
-                            best_model = name.replace("models/", "")
-            return best_model
-    except Exception:
-        pass
-        
-    return "gemini-2.0-flash" # Hata olursa varsayılan
-
 # ----------------- GEMINI API İLE METİN DÜZENLEME -----------------
 def call_gemini_ai(raw_note, api_key):
-    best_model = get_latest_flash_model(api_key)
-    
+    candidate_models = get_available_flash_models(api_key)[:3]
+
     system_prompt = (
         "Sen profesyonel bir İSG Saha Denetim Danışmanısın. "
         "Gelen gözlem notlarını profesyonel bir rapora dönüştür. "
@@ -232,18 +276,30 @@ def call_gemini_ai(raw_note, api_key):
         "Yanıtı SADECE şu JSON formatında ver: {\"tespit\": \"...\", \"oneri\": \"...\", \"yasal\": \"Yönetmelik 1\\nYönetmelik 2\"}"
     )
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{best_model}:generateContent?key={api_key}"
     payload = {
         "contents": [{"parts": [{"text": f"Gözlem: \"{raw_note}\""}]}],
         "systemInstruction": {"parts": [{"text": system_prompt}]},
         "generationConfig": {"responseMimeType": "application/json"}
     }
-    
-    response = requests.post(url, json=payload, timeout=30)
-    if response.status_code != 200:
-        raise Exception(f"Google API Hatası: {response.text}")
-    
-    return json.loads(response.json()["candidates"][0]["content"]["parts"][0]["text"])
+
+    errors = []
+    for model_name in candidate_models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+        try:
+            response = requests.post(url, json=payload, timeout=60)
+            if response.status_code == 200:
+                text_out = response.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+                if text_out.startswith("```"):
+                    text_out = re.sub(r"^```(?:json)?\s*|\s*```$", "", text_out, flags=re.DOTALL).strip()
+                return json.loads(text_out), model_name
+            else:
+                errors.append(f"{model_name} (HTTP {response.status_code}): {response.text[:200]}")
+        except requests.exceptions.Timeout:
+            errors.append(f"{model_name}: Zaman aşımı (60 sn)")
+        except Exception as e:
+            errors.append(f"{model_name}: {str(e)}")
+
+    raise Exception("Modellerden yanıt alınamadı:\n" + "\n".join(errors))
 
 # ----------------- WORD BELGESİ OLUŞTURMA -----------------
 def generate_word_report(report_date, dept, location, sicil_no, findings):
@@ -632,13 +688,13 @@ if ai_btn:
         with st.spinner("İSG standartlarına göre düzenleniyor..."):
             try:
                 note = st.session_state[f"raw_note_{f_id}"]
-                res = call_gemini_ai(note, active_api_key)
+                res, used_model = call_gemini_ai(note, active_api_key)
                 
                 st.session_state[f"tespit_{f_id}"] = res.get("tespit", "")
                 st.session_state[f"oneri_{f_id}"] = res.get("oneri", "")
                 st.session_state[f"yasal_{f_id}"] = res.get("yasal", "")
                 
-                st.success("Yapay zeka düzenledi!")
+                st.success(f"Yapay zeka düzenledi! (Model: {used_model})")
             except Exception as e:
                 st.error(f"Hata: {str(e)}")
 
